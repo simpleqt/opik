@@ -1,0 +1,76 @@
+[OPIK-8230] fix(traces): scope the delete mutation to the batch's own partitions
+
+A ClickHouse mutation is registered against every active part of the target
+table before its WHERE clause is even considered - the existing partition
+predicate (OPIK_6901) prunes which rows a matched part rewrites, not which
+parts the mutation visits at all. Post-cutover traces_local has ~1,900
+partitions / ~3,650 parts, so an ordinary delete matching a handful of rows
+was registered against all of them, at ~19ms/part fixed overhead. That is
+what pushed deletes past max_execution_time (Code 159 TIMEOUT_EXCEEDED),
+where the statement errors and skips the TracesDeleted cascade and the
+deletion-events bridge write even though the mutation completes and the
+rows are in fact deleted.
+
+Scope each statement to the partitions its own batch resolves to via
+IN PARTITION, derived by WeeklyPartitions#groupByPartition (new; groups
+ids by partition rather than naming their union - IN PARTITION accepts
+exactly one partition per statement). One statement per partition,
+falling back to the unbounded form when the batch cannot be derived
+exactly, or when the target table is not partitioned.
+
+That last condition has to be gated, not inferred from the table name.
+Unlike the id_at predicate it supersedes - MATERIALIZED on both topologies,
+so valid everywhere and merely unpruned on an unpartitioned table -
+IN PARTITION against a table with no PARTITION BY is a hard Code 248
+INVALID_PARTITION_VALUE. A name check is wrong in both directions:
+post-EXCHANGE/pre-wrap `traces` is already the partitioned successor while
+the wrap flag is still false, so the check resolves to "traces", takes the
+fallback on every delete, and does nothing in exactly the state production
+is in today; and wrap-on without the EXCHANGE is a real supported topology
+(TracesDistributedWrapMutationTest) where traces_local is the legacy
+unpartitioned table and IN PARTITION fails outright.
+
+The gate reuses traceColumnsNonNullable rather than adding a flag. The
+EXCHANGE that replaces the Nullable(...) columns is the same one that puts
+the weekly-partitioned successor behind the name mutations target, so the
+two facts have only ever flipped together, and a second flag would have to
+be carried through the cutover runbook and tooling to track no independent
+state. Verified against all four topologies: legacy pre-cutover and
+wrap-without-EXCHANGE both read false and take the unbounded form;
+production today and the pruning suite both read true and scope. The name
+says only its first duty and is deliberately not renamed - the env var is
+exposed - so both it and the config comment now document the second.
+
+This leaves no deployment surface: no new config key, no Helm or
+docker-compose change, nothing to add to the runbook.
+
+Both forms share one SQL template with an <if(partition)> conditional, and
+WeeklyPartitions#of (the flat-union predecessor) is removed - it had no
+production callers once TraceDAO switched to groupByPartition. Its unique
+boundary-case coverage moved to groupByPartition rather than being dropped.
+
+A null project or trace id in the batch is now rejected at the DAO's entry
+point rather than surfacing as an NPE while stringifying the binds. The NPE
+is pre-existing - `pair.getRight().toString()` is unchanged by this diff -
+but the partitioned path makes it worse: WeeklyPartitions reads a null as
+"underivable", so the batch silently takes the unbounded fallback, and a
+caller's bug reports as the slow delete this change exists to remove. The
+check sits before the gate, so it holds whichever branch deleteBatch takes.
+
+Verified locally against real ClickHouse via testcontainers, 35/35:
+- WeeklyPartitionsTest 17, TracesPartitionPruningMutationTest 9,
+  TracesDistributedWrapMutationTest 4, TracesLegacyTablePruningMutationTest 2,
+  TraceMutationRoutingArchTest 3
+- The pruning suite asserts on system.part_log MutatePart events rather than
+  EXPLAIN, which reports read-planner pruning - a different layer from what a
+  mutation is registered against, and the gap the previous coverage fell into.
+- Gate verified by negative control: forced off, the emitted SQL carries no
+  IN PARTITION and 5 of the 9 pruning tests fail, so the gate is not vacuous.
+- Null precondition likewise: removed, the new test reproduces exactly the
+  reported NPE rather than the IllegalArgumentException it asserts.
+- Log reads poll a fast-flushing container config instead of SYSTEM FLUSH
+  LOGS, which pushed only what had already buffered and so raced the rows it
+  was meant to reveal.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+

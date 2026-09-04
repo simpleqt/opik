@@ -112,10 +112,15 @@ public class OnlineScoringTraceThreadLlmAsJudgeScorer extends OnlineScoringBaseS
         log.info("Message received with projectId: '{}', ruleId: '{}', threadIds: '{}' for workspace '{}'",
                 message.projectId(), message.ruleId(), message.threadIds(), message.workspaceId());
 
+        // Since OPIK-8262 the publisher writes one stream entry per thread id, so this iterates a
+        // single-element list on anything enqueued by this build and the fan-out below is a no-op — the
+        // entry's ack/remove granularity and its failure granularity finally coincide. The loop stays for
+        // the rolling-upgrade window, where entries written by the previous build still carry several
+        // thread ids; see emitFanOutFailure for what a partial failure does to such an entry.
         return Flux.fromIterable(message.threadIds())
                 // Score each thread id independently: a single thread's failure must not stop scoring the
                 // sibling thread ids. Per-thread errors are materialized (onErrorResume) so the flatMap
-                // completes for every thread; the batch's first failure is then re-surfaced below. This keeps
+                // completes for every thread; the surviving failure is then re-surfaced below. This keeps
                 // the failure on the Mono error path handled by BaseRedisSubscriber.processMessage's
                 // onErrorResume — classified as a processing error, following the normal retryable/
                 // non-retryable path — instead of leaking into the enclosing onErrorContinue via Flux.flatMap
@@ -124,7 +129,7 @@ public class OnlineScoringTraceThreadLlmAsJudgeScorer extends OnlineScoringBaseS
                         .then(Mono.<Throwable>empty())
                         .onErrorResume(Mono::just))
                 .collectList()
-                .flatMap(errors -> errors.isEmpty() ? Mono.<Void>empty() : Mono.error(errors.getFirst()))
+                .flatMap(OnlineScoringBaseScorer::emitFanOutFailure)
                 .contextWrite(context -> context.put(RequestContext.WORKSPACE_ID, message.workspaceId())
                         .put(RequestContext.USER_NAME, message.userName())
                         .put(RequestContext.VISIBILITY, Visibility.PRIVATE))

@@ -49,15 +49,17 @@ class TraceThreadOnlineScorerPublisher {
                         Set<String> threadIds = ruleIdToThreadIds.getValue();
 
                         log.info(
-                                "Enqueuing threads: '{}' trace threads for ruleId: '{}' in projectId '{}' for workspaceId '{}'",
-                                threadIds, ruleId, projectId, workspaceId);
+                                "Enqueuing '{}' stream entries, one per trace thread: '{}' for ruleId: '{}' in projectId '{}' for workspaceId '{}'",
+                                threadIds.size(), threadIds, ruleId, projectId, workspaceId);
 
                         // Composed into the deferContextual chain so the enqueue inherits this workspace context.
+                        // One stream entry per thread id (OPIK-8262), so a retry of one thread never replays
+                        // its siblings.
                         return onlineScorePublisher.enqueueThreadMessage(List.copyOf(threadIds), ruleId, projectId,
                                 workspaceId, userName)
                                 .doOnSuccess(unused -> log.info(
-                                        "Enqueued threads: '{}' trace threads for ruleId: '{}' in projectId '{}' for workspaceId '{}'",
-                                        threadIds, ruleId, projectId, workspaceId));
+                                        "Enqueued '{}' stream entries, one per trace thread: '{}' for ruleId: '{}' in projectId '{}' for workspaceId '{}'",
+                                        threadIds.size(), threadIds, ruleId, projectId, workspaceId));
                     })
                     .then();
         });

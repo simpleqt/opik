@@ -33,17 +33,22 @@ import dev.langchain4j.model.chat.request.ChatRequest;
 import dev.langchain4j.model.chat.request.json.JsonObjectSchema;
 import dev.langchain4j.model.chat.response.ChatResponse;
 import io.dropwizard.util.Duration;
+import jakarta.ws.rs.ClientErrorException;
+import jakarta.ws.rs.InternalServerErrorException;
 import jakarta.ws.rs.NotFoundException;
 import org.apache.commons.lang3.RandomStringUtils;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Nested;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.Arguments;
+import org.junit.jupiter.params.provider.CsvSource;
 import org.junit.jupiter.params.provider.MethodSource;
 import org.mockito.ArgumentCaptor;
+import org.mockito.ArgumentMatcher;
 import org.mockito.ArgumentMatchers;
 import org.mockito.Mock;
 import org.mockito.MockedStatic;
@@ -781,6 +786,96 @@ class OnlineScoringTraceThreadLlmAsJudgeScorerTest {
                     eq(loggedMessage));
             verify(aiProxyService, never()).scoreTrace(any(), any(), any());
             verify(feedbackScoreService, never()).scoreBatchOfThreads(any());
+        }
+    }
+
+    /**
+     * OPIK-8262. Since this change the publisher writes one stream entry per thread id, so
+     * {@code score()} normally iterates a single-element list and there is nothing to reduce. These cases
+     * pin the <b>rolling-upgrade window</b>: an entry written by the previous build still carries several
+     * thread ids, and {@link BaseRedisSubscriber} acks and removes per entry, so those siblings share one
+     * verdict. The scorer used to surface {@code errors.getFirst()} — arbitrary, and harmless only while
+     * every provider failure was a blanket retryable 500. The status split shipping alongside this makes an
+     * arbitrary pick able to drop a retryable evaluation on its first delivery, so the surviving error is
+     * now the retryable one.
+     */
+    @Nested
+    @DisplayName("Multi-id entries from the previous build (rolling upgrade)")
+    class FanOutFailureTests {
+
+        @Test
+        @DisplayName("No errors means no failure")
+        void emitsNothingWhenEveryThreadSucceeded() {
+            assertThat(OnlineScoringBaseScorer.emitFanOutFailure(List.of()).block()).isNull();
+        }
+
+        static Stream<Arguments> mixedFailures() {
+            var permanent = new ClientErrorException("gateway rejected the request", 400);
+            var alsoPermanent = new IllegalArgumentException("also non-retryable");
+            var retryable = new InternalServerErrorException("provider had a bad moment");
+            var alsoRetryable = new RuntimeException("unknown type, retryable by default");
+            return Stream.of(
+                    Arguments.of("permanent first", List.of(permanent, retryable), retryable),
+                    Arguments.of("retryable first", List.of(retryable, permanent), retryable),
+                    Arguments.of("permanent flanking a retryable",
+                            List.of(permanent, retryable, alsoPermanent), retryable),
+                    Arguments.of("first of several retryables wins",
+                            List.of(retryable, alsoRetryable), retryable),
+                    // No retryable to prefer: the entry can only be retired, so any of them will do and the
+                    // pre-existing first-wins choice stands.
+                    Arguments.of("all permanent falls back to the first",
+                            List.of(permanent, alsoPermanent), permanent));
+        }
+
+        @ParameterizedTest(name = "{0}")
+        @MethodSource("mixedFailures")
+        @DisplayName("The retryable failure survives, so no retryable evaluation is dropped by a sibling")
+        void prefersTheRetryableFailure(String name, List<Throwable> errors, Throwable expected) {
+            assertThatThrownBy(() -> OnlineScoringBaseScorer.emitFanOutFailure(errors).block())
+                    .as("a permanent sibling must not decide the fate of a retryable one")
+                    .isSameAs(expected);
+        }
+
+        /**
+         * The same rule through the real {@code score()} chain rather than the helper in isolation, on a
+         * two-id message of exactly the shape a pre-upgrade entry has. The permanent failure is deliberately
+         * the <em>first</em> thread id: that is the ordering under which the old {@code errors.getFirst()}
+         * returns the wrong answer.
+         */
+        @ParameterizedTest(name = "{0}")
+        @CsvSource({
+                "permanent thread first, true",
+                "retryable thread first, false",
+        })
+        @DisplayName("A multi-id entry surfaces the retryable failure whichever thread failed first")
+        void multiIdEntrySurfacesTheRetryableFailure(String name, boolean permanentFirst) {
+            var permanentThreadId = "thread-permanent-" + RandomStringUtils.secure().nextAlphanumeric(16);
+            var retryableThreadId = "thread-retryable-" + RandomStringUtils.secure().nextAlphanumeric(16);
+            var permanentFailure = new ClientErrorException("oversized request rejected by the gateway", 400);
+            var retryableFailure = new InternalServerErrorException("provider had a bad moment");
+            var message = sampleMessage().toBuilder()
+                    .threadIds(permanentFirst
+                            ? List.of(permanentThreadId, retryableThreadId)
+                            : List.of(retryableThreadId, permanentThreadId))
+                    .build();
+
+            when(traceService.search(anyInt(), ArgumentMatchers.argThat(forThread(permanentThreadId))))
+                    .thenReturn(Flux.error(permanentFailure));
+            when(traceService.search(anyInt(), ArgumentMatchers.argThat(forThread(retryableThreadId))))
+                    .thenReturn(Flux.error(retryableFailure));
+
+            assertThatThrownBy(() -> scorer.score(message).block())
+                    .as("dropping the entry on the permanent sibling would discard the retryable thread's"
+                            + " evaluation for good")
+                    .isSameAs(retryableFailure);
+        }
+
+        /** Matches the {@code TraceSearchCriteria} the scorer builds for one specific thread id. */
+        private static ArgumentMatcher<TraceSearchCriteria> forThread(String threadId) {
+            return criteria -> criteria != null
+                    && criteria.filters() != null
+                    && criteria.filters().stream()
+                            .anyMatch(filter -> threadId.equals(filter.value()));
         }
     }
 

@@ -229,6 +229,51 @@ public abstract class OnlineScoringBaseScorer<M extends RedisSubscriberMessage> 
      * @return a Flux of Trace objects representing the full thread context
      */
     //TODO: Move this to a common service or utility class
+    /**
+     * Reduces the per-thread outcomes of one trace-thread stream entry into the single error whose
+     * retryability decides that entry's fate, preferring a retryable one.
+     *
+     * <p><b>New entries never need this.</b> Since OPIK-8262 {@code OnlineScorePublisher} publishes one
+     * stream entry per thread id, so the list this receives holds at most one error and the choice is
+     * vacuous. It exists for the <b>rolling-upgrade window</b>: entries written by the previous build
+     * carry several thread ids, and a new consumer must still process them. Once no such entry can be in
+     * flight, this and the loops that feed it are dead weight and can go.
+     *
+     * <p><b>Why retryable wins on a mixed multi-id entry.</b> {@link BaseRedisSubscriber} acks and removes
+     * per entry, so N thread ids under one entry share one verdict and one of the two errors has to be
+     * mis-served:
+     * <ul>
+     *   <li>emitting the permanent one drops the transient sibling's evaluation for good — work that
+     *       would have succeeded seconds later is silently lost;</li>
+     *   <li>emitting the retryable one replays the whole entry, so the ids that already succeeded are
+     *       scored again. That costs extra provider calls, but {@code feedback_scores} is a
+     *       {@code ReplacingMergeTree} keyed on the score's identity with {@code last_updated_at} as the
+     *       version, so a re-score overwrites rather than duplicates, and the permanent sibling still
+     *       retires at {@code maxRetries}.
+     * </ul>
+     * Losing work is worse than repeating it, so this prefers the retryable error — the same bias
+     * {@link BaseRedisSubscriber#isRetryableException} already applies to unknown exception types. Note
+     * this is a strictly bounded regret: it can only fire for entries written before the deploy.
+     *
+     * <p>Before OPIK-8262 the choice was {@code errors.getFirst()}, which is arbitrary. That was harmless
+     * only because {@code ChatCompletionService.scoreTrace} answered every provider failure with a blanket
+     * 500, making every sibling retryable; the status split in this same change is what makes an arbitrary
+     * pick able to pick wrong.
+     *
+     * @param errors the per-thread failures, in completion order; empty when every thread id succeeded
+     * @return empty when {@code errors} is empty, otherwise an error carrying the first retryable failure,
+     *         or the first failure of any kind when none is retryable
+     */
+    protected static Mono<Void> emitFanOutFailure(@NonNull List<Throwable> errors) {
+        if (errors.isEmpty()) {
+            return Mono.empty();
+        }
+        return Mono.error(errors.stream()
+                .filter(BaseRedisSubscriber::isRetryableException)
+                .findFirst()
+                .orElseGet(errors::getFirst));
+    }
+
     protected Flux<Trace> retrieveFullThreadContext(@NotNull String threadId,
             @NotNull AtomicReference<UUID> lastReceivedIdRef, @NotNull UUID projectId) {
 

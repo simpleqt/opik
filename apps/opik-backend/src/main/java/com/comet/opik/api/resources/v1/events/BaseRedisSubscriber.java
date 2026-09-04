@@ -833,8 +833,15 @@ public abstract class BaseRedisSubscriber<M> implements Managed {
      * Non-retryable exceptions are usually programming, validation, client errors that won't succeed on retry.
      * All other exceptions are considered retryable (transient errors like network issues, timeouts, server errors, etc.)
      * Unknown exceptions default to retryable for safety.
+     * <p>
+     * Exposed to subclasses (OPIK-8262) so a subscriber that has to reduce several outcomes into the one
+     * error this entry's fate is decided by can ask the base class which of them is retryable, instead of
+     * re-deriving the classification or picking arbitrarily. See
+     * {@link OnlineScoringBaseScorer#emitFanOutFailure(java.util.List)}, the only such caller — new ones
+     * should be viewed with suspicion, since an entry that needs per-item verdicts usually wants to be
+     * several entries instead.
      */
-    private boolean isRetryableException(Throwable exception) {
+    protected static boolean isRetryableException(Throwable exception) {
         return NON_RETRYABLE_EXCEPTIONS.stream()
                 .noneMatch(nonRetryable -> nonRetryable.isInstance(exception));
     }

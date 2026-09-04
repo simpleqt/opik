@@ -56,29 +56,32 @@ public interface OnlineScorePublisher {
     Mono<Void> enqueueMessage(List<?> messages, AutomationRuleEvaluatorType type);
 
     /**
-     * Enqueues a thread message for scoring based on the provided rule. The returned publisher must be subscribed
-     * for the enqueue to happen.
+     * Enqueues thread messages for scoring based on the provided rule — <b>one stream entry per thread
+     * id</b>, not one entry for the batch. The returned publisher must be subscribed for the enqueue to
+     * happen.
      *
-     * @param threadIds   the IDs of the threads to score
+     * @param threadIds   the IDs of the threads to score; one message is published per element
      * @param ruleId      the ID of the rule to apply
      * @param projectId   the ID of the project
      * @param workspaceId the ID of the workspace
      * @param userName    the name of the user who initiated the scoring
-     * @return a {@link Mono} that completes once the message is enqueued
+     * @return a {@link Mono} that completes once all messages are enqueued
      */
     Mono<Void> enqueueThreadMessage(List<String> threadIds, UUID ruleId, UUID projectId, String workspaceId,
             String userName);
 
     /**
-     * Enqueues a thread message for an already-resolved rule, avoiding the blocking rule lookup that the
-     * {@code ruleId} overload performs. Prefer this when the caller already holds the {@link AutomationRuleEvaluator}.
+     * Enqueues thread messages for an already-resolved rule, avoiding the blocking rule lookup that the
+     * {@code ruleId} overload performs. Prefer this when the caller already holds the
+     * {@link AutomationRuleEvaluator}. Publishes <b>one stream entry per thread id</b>, not one entry for
+     * the batch.
      *
-     * @param threadIds   the IDs of the threads to score
+     * @param threadIds   the IDs of the threads to score; one message is published per element
      * @param rule        the already-resolved automation rule evaluator
      * @param projectId   the ID of the project
      * @param workspaceId the ID of the workspace
      * @param userName    the name of the user who initiated the scoring
-     * @return a {@link Mono} that completes once the message is enqueued
+     * @return a {@link Mono} that completes once all messages are enqueued
      */
     Mono<Void> enqueueThreadMessage(List<String> threadIds, AutomationRuleEvaluator<?, ?> rule, UUID projectId,
             String workspaceId, String userName);
@@ -186,15 +189,35 @@ class OnlineScorePublisherImpl implements OnlineScorePublisher {
             @NonNull String userName) {
 
         // Caller already holds the resolved rule — no findById needed.
+        //
+        // OPIK-8262: one message PER THREAD ID, not one message carrying the whole list. The consuming
+        // subscriber's ack/remove granularity is per stream entry, so an entry holding N thread ids forces
+        // N independent outcomes through a single verdict; with the provider-status split in this same
+        // change, a permanent 400 on one thread and a transient 429 on another can now land under one
+        // entry, and whichever the consumer surfaces mis-serves the other. Splitting the entry deletes
+        // that problem instead of managing it: a retry replays exactly the thread id that failed.
+        //
+        // The cost is N stream entries where there was 1. Each carries the same rule code, so the stream
+        // grows roughly linearly in thread count for a batch enqueue; the streams are capped by
+        // streamMaxLen and trimmed non-strictly, so this trades stream volume for correct retry scope.
+        //
+        // An empty threadIds list now publishes nothing rather than one entry with an empty threadIds —
+        // which the @NotEmpty on the message record says should never have been written in the first place.
         return switch (rule) {
             case AutomationRuleEvaluatorTraceThreadLlmAsJudge llmAsJudge -> enqueueMessage(
-                    List.of(toLlmAsJudgeMessage(threadIds, rule.getId(), projectId, workspaceId, userName,
-                            llmAsJudge.getCode())),
+                    threadIds.stream()
+                            .map(threadId -> toLlmAsJudgeMessage(threadId, rule.getId(), projectId, workspaceId,
+                                    userName, llmAsJudge.getCode()))
+                            .toList(),
                     rule.getType());
             case AutomationRuleEvaluatorTraceThreadUserDefinedMetricPython definedMetricPython -> {
                 if (serviceTogglesConfig.isTraceThreadPythonEvaluatorEnabled()) {
-                    yield enqueueMessage(List.of(toDefinedMetricPython(threadIds, rule.getId(), projectId,
-                            workspaceId, userName, definedMetricPython.getCode())), rule.getType());
+                    yield enqueueMessage(
+                            threadIds.stream()
+                                    .map(threadId -> toDefinedMetricPython(threadId, rule.getId(), projectId,
+                                            workspaceId, userName, definedMetricPython.getCode()))
+                                    .toList(),
+                            rule.getType());
                 }
                 log.warn("Trace Thread online scoring python evaluator is disabled, skipping enqueueing "
                         + "for ruleId: '{}'", rule.getId());
@@ -204,10 +227,16 @@ class OnlineScorePublisherImpl implements OnlineScorePublisher {
         };
     }
 
-    private TraceThreadToScoreLlmAsJudge toLlmAsJudgeMessage(List<String> threadIds, UUID ruleId, UUID projectId,
+    /**
+     * {@code threadIds} stays a {@code List<String>} on the message record even though this only ever puts
+     * one id in it: a consumer running the new build must keep reading the multi-id entries the previous
+     * build left in the stream during a rolling upgrade. Narrowing the field to a single {@code String}
+     * would make those entries undecodable for the exact deploy in which this change ships.
+     */
+    private TraceThreadToScoreLlmAsJudge toLlmAsJudgeMessage(String threadId, UUID ruleId, UUID projectId,
             String workspaceId, String userName, TraceThreadLlmAsJudgeCode code) {
         return TraceThreadToScoreLlmAsJudge.builder()
-                .threadIds(threadIds)
+                .threadIds(List.of(threadId))
                 .ruleId(ruleId)
                 .projectId(projectId)
                 .workspaceId(workspaceId)
@@ -216,10 +245,11 @@ class OnlineScorePublisherImpl implements OnlineScorePublisher {
                 .build();
     }
 
-    private TraceThreadToScoreUserDefinedMetricPython toDefinedMetricPython(List<String> threadIds, UUID ruleId,
+    /** @see #toLlmAsJudgeMessage on why {@code threadIds} stays a list holding one id. */
+    private TraceThreadToScoreUserDefinedMetricPython toDefinedMetricPython(String threadId, UUID ruleId,
             UUID projectId, String workspaceId, String userName, TraceThreadUserDefinedMetricPythonCode code) {
         return TraceThreadToScoreUserDefinedMetricPython.builder()
-                .threadIds(threadIds)
+                .threadIds(List.of(threadId))
                 .ruleId(ruleId)
                 .projectId(projectId)
                 .workspaceId(workspaceId)
